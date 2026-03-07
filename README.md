@@ -1,6 +1,6 @@
 # Stitch Mobile AR/VR
 
-![Project Walkthrough](./Recording 2026-03-07 175844.gif)
+![Project Walkthrough](./giff.gif)
 
 
 This project demonstrates a computer vision–based augmented reality screen projection system. Using feature detection and homography estimation, the application can project a digital screen (such as a laptop display screenshot) onto a real-world surface captured by a camera.
