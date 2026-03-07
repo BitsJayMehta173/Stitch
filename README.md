@@ -1,5 +1,8 @@
 # Stitch Mobile AR/VR
 
+![Project Walkthrough](./Recording 2026-03-07 175844.gif)
+
+
 This project demonstrates a computer vision–based augmented reality screen projection system. Using feature detection and homography estimation, the application can project a digital screen (such as a laptop display screenshot) onto a real-world surface captured by a camera.
 
 The system detects a predefined reference surface using SIFT feature detection and feature matching, estimates the surface orientation through homography transformation, and overlays a digital screen onto that surface in real time or across video frames.
