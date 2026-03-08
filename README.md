@@ -3,6 +3,15 @@
 ![Project Walkthrough](./giff.gif)
 
 
+# Updates
+
+#### Run tep2.py for now
+#### where you first need to install DroidCam on your mobile device and Your PC 
+#### Then use the IP address of the Mobile camera to access the live feed 
+#### Then you can change the overlay.png and reference.jpg to your choice to experience the mobile AR/VR of your own.
+
+# Overview
+
 This project demonstrates a computer vision–based augmented reality screen projection system. Using feature detection and homography estimation, the application can project a digital screen (such as a laptop display screenshot) onto a real-world surface captured by a camera.
 
 The system detects a predefined reference surface using SIFT feature detection and feature matching, estimates the surface orientation through homography transformation, and overlays a digital screen onto that surface in real time or across video frames.
