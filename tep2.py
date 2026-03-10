@@ -1,6 +1,3 @@
-# Our Main Motive is Digital Garbage Digital AR/VR Social Media 
-# People Can Visit the digital Garbage People Throws at a Perfectly Fine Place In the World Which Will be REcognized By many Different Means Like Location, GPS, Gyroscope Map, GTA MAP TYPE SHIT WORLD BRODAA,,,,Suppose EveryOne Will Be Allowed to throw A Single Cocacola Can On A specific Place Once the Application Is Launched Just In the Rememberance of the App Launch You Might be able to see people throwing cans digitally, these are just metaphor for people thats my negative thinking people have to think positive themselves I dont know what you might use it for,, but the future is different for sure but it starts with thissss.
-
 
 
 import cv2
@@ -19,8 +16,9 @@ import time
 
 # ================================
 # ================================
-URL = "http://X.X.X.X:Y/video"
+# URL = "http://X.X.X.X:Y/video"
 
+# So the Problem right now is the images which has low keypoints and descriptors have slow processing power and recognition power
 
 # Change the reference.jpg image to the object on which you want to overlay
 REFERENCE_IMAGE = "reference.jpg"
