@@ -1,7 +1,21 @@
 # Stitch Mobile AR/VR
 
+### Our Main Motive is Digital Garbage Digital AR/VR Social Media 
+
+### People Can Visit the digital Garbage People Throws at a Perfectly Fine Place In the World Which Will be REcognized By many Different Means Like Location, GPS, Gyroscope Map, GTA MAP TYPE SHIT WORLD BRODAA,,,,Suppose EveryOne Will Be Allowed to throw A Single Cocacola Can On A specific Place Once the Application Is Launched Just In the Rememberance of the App Launch You Might be able to see people throwing cans digitally, these are just metaphor for people thats my negative thinking people have to think positive themselves I dont know what you might use it for,, but the future is different for sure but it starts with thissss.
+
+
 ![Project Walkthrough](./giff.gif)
 
+
+# Updates
+
+#### Run tep2.py for now
+#### where you first need to install DroidCam on your mobile device and Your PC 
+#### Then use the IP address of the Mobile camera to access the live feed 
+#### Then you can change the overlay.png and reference.jpg to your choice to experience the mobile AR/VR of your own.
+
+# Overview
 
 This project demonstrates a computer vision–based augmented reality screen projection system. Using feature detection and homography estimation, the application can project a digital screen (such as a laptop display screenshot) onto a real-world surface captured by a camera.
 
