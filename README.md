@@ -10,7 +10,7 @@
 
 # Updates
 
-#### Run tep2.py for now
+#### Run tep3.py for now
 #### where you first need to install DroidCam on your mobile device and Your PC 
 #### Then use the IP address of the Mobile camera to access the live feed 
 #### Then you can change the overlay.png and reference.jpg to your choice to experience the mobile AR/VR of your own.
