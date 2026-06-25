@@ -14,7 +14,7 @@ import time
 
 # ================================
 # ================================
-URL = "http://X.X.X.X:Y/video"
+URL = "http://192.168.1.7:4747/video"
 
 
 
@@ -29,6 +29,9 @@ FRAME_RESIZE = (960,540)
 MIN_TRACKED_POINTS = 20
 FB_CHECK_INTERVAL = 5
 SMOOTH_ALPHA = 0.85
+
+# Downscale factor for SIFT detection (e.g., 0.5 means half resolution)
+SIFT_SCALE = 0.5
 
 # detection cooldown
 DETECT_BASE_INTERVAL = 3
@@ -107,6 +110,9 @@ def valid_homography(H):
 
 def geometric_filter(prev_pts,new_pts,ref_pts):
 
+    if len(new_pts) == 0:
+        return new_pts, ref_pts, prev_pts
+
     motion = new_pts - prev_pts
     median_motion = np.median(motion,axis=0)
 
@@ -114,7 +120,7 @@ def geometric_filter(prev_pts,new_pts,ref_pts):
 
     mask = diff < 5.0
 
-    return new_pts[mask], ref_pts[mask]
+    return new_pts[mask], ref_pts[mask], prev_pts[mask]
 
 
 # =====================================
@@ -125,7 +131,11 @@ def detect(gray):
 
     global prev_pts,ref_pts
 
-    kp_frame,des_frame=sift.detectAndCompute(gray,None)
+    # 1. Downscale the frame to drastically reduce SIFT processing time
+    small_gray = cv2.resize(gray, (0, 0), fx=SIFT_SCALE, fy=SIFT_SCALE)
+    
+    # 2. Run SIFT on the smaller image
+    kp_frame,des_frame=sift.detectAndCompute(small_gray,None)
 
     if des_frame is None:
         return False
@@ -145,9 +155,12 @@ def detect(gray):
         [kp_ref[m.queryIdx].pt for m in good]
     ).reshape(-1,1,2)
 
+    # 3. Rescale the points back to original resolution so optical flow and homography work properly
     prev_pts=np.float32(
         [kp_frame[m.trainIdx].pt for m in good]
     ).reshape(-1,1,2)
+    
+    prev_pts /= SIFT_SCALE
 
     return True
 
@@ -255,7 +268,7 @@ while True:
     # GEOMETRIC CONSISTENCY
     # ---------------------------------
 
-    good_new,good_ref = geometric_filter(good_prev,good_new,good_ref)
+    good_new,good_ref,good_prev = geometric_filter(good_prev,good_new,good_ref)
 
     if len(good_new)<MIN_TRACKED_POINTS:
 
@@ -278,7 +291,18 @@ while True:
         if prev_H is None:
             H=H_candidate
         else:
-            H=SMOOTH_ALPHA*prev_H+(1-SMOOTH_ALPHA)*H_candidate
+            # Dynamic Anti-Jitter: Check how much the points actually moved
+            movement = np.linalg.norm(good_new - good_prev, axis=1).mean()
+            
+            if movement < 0.8:
+                # If camera is basically still, LOCK the AR overlay completely (no jitter)
+                H = prev_H
+            elif movement < 2.5:
+                # If moving slowly, apply HEAVY smoothing
+                H = 0.92 * prev_H + 0.08 * H_candidate
+            else:
+                # If moving normally, use standard smooth
+                H = SMOOTH_ALPHA * prev_H + (1 - SMOOTH_ALPHA) * H_candidate
 
         prev_H=H
 
