@@ -6,6 +6,8 @@ import os
 import sys
 import time
 
+import calibration
+
 # =====================================
 # CONFIGURATION
 # =====================================
@@ -23,8 +25,15 @@ URL = "http://192.168.1.7:4747/video"
 # You can also pass the stream URL or a video file on the command line:
 #   python tep3.py http://192.168.1.7:4747/video
 #   python tep3.py video.mp4
-if len(sys.argv) > 1:
-    URL = sys.argv[1]
+# Options:
+#   --calibrate   start a calibration sweep as soon as the target is found
+#                 (or press 'c' in the video window at any time)
+#   --no-map      ignore a saved calibration map
+ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
+FLAGS = {a for a in sys.argv[1:] if a.startswith("--")}
+
+if ARGS:
+    URL = ARGS[0]
 
 IS_FILE = os.path.isfile(URL)
 
@@ -92,10 +101,18 @@ TARGET_TRACK_POINTS = 120
 LOST_FAST_FRAMES = 5        # search every frame right after a loss, for a quick recovery
 LOST_DETECT_EVERY = 3       # then only every Nth frame, so a long loss does not tank the FPS
 BLUR_RATIO = 0.2            # frames this much blurrier than a typical tracked frame skip SIFT
+SAFETY_DETECT_EVERY = 15    # full-frame check every N frames while predicted out of view
 
 # ---- stream ----
 STREAM_TIMEOUT = 3.0        # seconds without frames before reconnecting to the stream
 STREAM_RECONNECTS = 3       # give up after this many failed reconnects
+
+# ---- scene calibration (see calibration.py) ----
+# A sweep around the target is saved per reference image and loaded on the next run.
+CALIBRATION_DIR = os.environ.get("STITCH_CALIB_DIR","calib")
+RELOC_INTERVAL = 10         # while lost, re-check the camera rotation against the map every N frames
+MAP_CHECK_EVERY = 30        # while tracking, check every N frames that the map agrees with the target
+MAP_AGREE_DEG = 8.0
 
 # detection cooldown
 DETECT_BASE_INTERVAL = 3
@@ -185,6 +202,38 @@ est_stale=False
 search_misses=0
 # frames since SIFT last confirmed the pose while tracking
 frames_since_anchor=0
+
+# ---- scene map state ----
+map_path=os.path.join(CALIBRATION_DIR,os.path.splitext(os.path.basename(REFERENCE_IMAGE))[0]+".npz")
+scene_map=None
+calibrating=False
+calibrate_requested="--calibrate" in FLAGS
+# camera rotation relative to the map (calibration start), and whether it is trustworthy
+R_cur=None
+R_stale=True
+K_cam=calibration.intrinsics(*FRAME_RESIZE)
+# A loaded map is only used after this session's camera view was matched against it:
+# the same reference image somewhere else, or walking around instead of turning in
+# place, would make its predictions wrong.
+map_ok=False
+reloc_fails=0
+
+if "--no-map" not in FLAGS and os.path.isfile(map_path):
+    scene_map=calibration.SceneMap.load(map_path)
+    K_cam=scene_map.K
+    lo,hi=scene_map.sweep_span()
+    print(f"Loaded scene map {map_path}: {len(scene_map.rotations)} keyframes, sweep {lo:.0f}..{hi:.0f} deg")
+
+
+def finish_calibration():
+    global calibrating
+    calibrating=False
+    if len(scene_map.rotations)<2:
+        print("Calibration cancelled: not enough keyframes")
+        return
+    scene_map.save(map_path)
+    lo,hi=scene_map.sweep_span()
+    print(f"Calibration saved to {map_path}: {len(scene_map.rotations)} keyframes, sweep {lo:.0f}..{hi:.0f} deg")
 
 prev_small=None
 motion_pts=None
@@ -496,24 +545,53 @@ def roi_around(quad,frame_shape):
     return (x1,y1,x2-x1,y2-y1)
 
 
-# arrow at the frame edge pointing to where the off-screen target is
+# arrow at the frame edge pointing to where the off-screen target is; give either the
+# predicted quad or (from the scene map, which also works when it is behind) a direction.
+# Returns the unit direction drawn, or None.
 
-def draw_offscreen_arrow(frame,quad):
+def draw_offscreen_arrow(frame,quad=None,direction=None):
 
     h,w=frame.shape[:2]
     centre=np.float32([w/2,h/2])
-    d=quad.reshape(-1,2).mean(axis=0)-centre
+
+    d = np.float32(direction) if direction is not None else quad.reshape(-1,2).mean(axis=0)-centre
     n=np.linalg.norm(d)
 
-    if n<1:
-        return
+    if n<1e-6 or (direction is None and n<1):
+        return None
 
-    d/=n
+    d=d/n
     tip=centre+d*min(w,h)*0.45
     tail=centre+d*min(w,h)*0.30
 
     cv2.arrowedLine(frame,tuple(int(v) for v in tail),tuple(int(v) for v in tip),
                     (0,200,255),4,tipLength=0.4)
+
+    return d
+
+
+# progress bar of the calibration sweep: covered yaw range out of +-90 degrees
+
+def draw_calibration_hud(frame,scene_map,waiting):
+
+    h,w=frame.shape[:2]
+    x0,x1,y=60,w-60,h-40
+
+    if waiting:
+        text="CALIBRATION: point the camera at the target to start"
+    else:
+        lo,hi=scene_map.sweep_span()
+        text=(f"CALIBRATING: turn slowly left and right, stay in place  "
+              f"{hi-lo:.0f}/{calibration.SWEEP_TARGET_DEG:.0f} deg, {len(scene_map.rotations)} keyframes  (c = finish)")
+        cv2.rectangle(frame,(x0,y-8),(x1,y+8),(80,80,80),-1)
+        to_x=lambda yaw: int(x0+(x1-x0)*(np.clip(yaw,-90,90)+90)/180)
+        cv2.rectangle(frame,(to_x(lo),y-8),(to_x(hi),y+8),(0,200,0),-1)
+        for R in scene_map.rotations:
+            cv2.line(frame,(to_x(scene_map.sweep_angle(R)),y-12),(to_x(scene_map.sweep_angle(R)),y+12),(255,255,255),2)
+        if R_cur is not None:
+            cv2.circle(frame,(to_x(scene_map.sweep_angle(R_cur)),y),9,(0,200,255),-1)
+
+    cv2.putText(frame,text,(20,h-70),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,255),2)
 
 
 # =====================================
@@ -554,7 +632,8 @@ prev_time=time.time()
 # =====================================
 
 LOG_FIELDS=["frame","t","fps","proc_ms","state","target_pts","motion_ok","motion_pts",
-            "tx","ty","rot_deg","detect_calls","detect_ms","lost_frames","visible","stale"]
+            "tx","ty","rot_deg","detect_calls","detect_ms","lost_frames","visible","stale",
+            "yaw","calibrating","arrow_x","arrow_y","corners_cx","corners_cy"]
 
 log_file=None
 input_writer=None
@@ -633,6 +712,8 @@ while True:
     H=None
     fixed=False
     state="lost"
+    arrow_dir=None
+    target_behind=False
 
     # ---------------------------------
     # CAMERA MOTION
@@ -658,6 +739,14 @@ while True:
         else:
             # the camera moved by an unknown amount: the estimate can no longer be trusted
             est_stale=True
+
+    # the same camera motion, as a rotation (for the scene map / calibration)
+    if R_cur is not None:
+        R_step = calibration.rotation_from_motion(M,K_cam) if M is not None else None
+        if R_step is not None:
+            R_cur = R_step @ R_cur
+        else:
+            R_stale = True
 
     found=None
     good_new=None
@@ -751,7 +840,44 @@ while True:
 
         lost_frames += 1
 
-        if corners_est is not None and lost_frames <= PREDICT_MAX_FRAMES:
+        # ---- scene map: where is the target, even when it is out of view? ----
+        if scene_map is not None and not calibrating:
+
+            # check the rotation against the keyframes right after a loss, then every
+            # RELOC_INTERVAL frames (camera motion keeps it updated in between); if the
+            # rotation is unknown, keep trying, backing off while it keeps failing
+            # (e.g. this is not the calibrated place) so it does not eat the frame rate
+            unknown = R_cur is None or R_stale or not map_ok
+            reloc_every = min(3*2**reloc_fails,30) if unknown else RELOC_INTERVAL
+            reloc_due = (lost_frames-1) % reloc_every == 0
+
+            if reloc_due and not blurry:
+                R_new = scene_map.relocalize(gray, None if unknown else R_cur)
+                if R_new is not None:
+                    if not map_ok:
+                        print("Scene map matched: using it to locate the target")
+                    R_cur,R_stale = R_new,False
+                    map_ok,reloc_fails = True,0
+                elif unknown:
+                    reloc_fails += 1
+
+            # only trust map predictions once the scene has actually been recognised
+            if map_ok and R_cur is not None and not R_stale:
+                corners_est = scene_map.project_target(R_cur,w_ref,h_ref)
+                target_behind = corners_est is None
+                est_stale = False
+
+        # predictions can be wrong (drift, a bad relocalization): while they say the target
+        # is out of view, still look over the whole frame now and then
+        safety_check = not blurry and lost_frames % SAFETY_DETECT_EVERY == 0
+
+        if target_behind:
+
+            # the map says it is behind the camera: nothing to search for
+            if safety_check:
+                found = detect(gray)
+
+        elif corners_est is not None and (lost_frames <= PREDICT_MAX_FRAMES or (scene_map is not None and not calibrating)):
 
             should_be_visible = visible_fraction(corners_est,gray.shape) > 0.2
 
@@ -772,6 +898,10 @@ while True:
 
                 if roi is not None:
                     found = detect(gray,roi)
+
+            elif safety_check:
+
+                found = detect(gray)
 
             if search_now and found is None and (est_stale or should_be_visible):
                 search_misses += 1
@@ -876,6 +1006,60 @@ while True:
     prev_gray=gray.copy()
 
     # ---------------------------------
+    # SCENE MAP / CALIBRATION
+    # ---------------------------------
+
+    if fixed and (scene_map is not None or calibrate_requested):
+
+        if calibrate_requested and not calibrating:
+            # the view where the target is first tracked becomes the map's origin
+            scene_map=calibration.SceneMap(K_cam,FRAME_RESIZE,H.copy(),MOTION_MASK_TOP)
+            calibrating,calibrate_requested=True,False
+            R_cur,R_stale=np.eye(3),False
+            map_ok=True
+            print("Calibration started: stay in place and turn the camera slowly left and right")
+
+        # the tracked target pins down the camera rotation exactly
+        R_t=scene_map.rotation_from_target(H)
+        if R_t is not None:
+            R_cur,R_stale=R_t,False
+
+            # Now and then check that the map agrees with the target. It will not if the
+            # target was moved, or if the camera moved away from where it was calibrated.
+            if not calibrating and frame_id % MAP_CHECK_EVERY == 0 and not blurry:
+                R_m=scene_map.relocalize(gray,R_t)
+                if R_m is not None:
+                    agrees=calibration.angle_between(R_m,R_t) < MAP_AGREE_DEG
+                    if agrees != map_ok:
+                        print("Scene map matched: using it to locate the target" if agrees else
+                              "Scene map disagrees with the target (moved?): ignoring the map for now")
+                    map_ok=agrees
+
+    if calibrating:
+
+        # lost track of the rotation mid-sweep (target out of view and motion failed):
+        # recover it from the keyframes captured so far
+        if R_stale and frame_id % 3 == 0 and not blurry:
+            R_new=scene_map.relocalize(gray)
+            if R_new is not None:
+                R_cur,R_stale=R_new,False
+
+        if R_cur is not None and not R_stale and not blurry:
+            n_before=len(scene_map.rotations)
+            R_cur=scene_map.maybe_add_keyframe(gray,R_cur)
+
+            # between keyframes the frame-to-frame estimate drifts (it was ~15 degrees
+            # off in a live sweep); pull it back to the nearest keyframe regularly
+            if not fixed and len(scene_map.rotations)==n_before and frame_id % 10 == 0:
+                R_new=scene_map.refine(gray,R_cur)
+                if R_new is not None:
+                    R_cur=R_new
+
+        lo,hi=scene_map.sweep_span()
+        if hi-lo >= calibration.SWEEP_TARGET_DEG:
+            finish_calibration()
+
+    # ---------------------------------
     # COAST THROUGH SHORT LOSSES
     # ---------------------------------
 
@@ -920,7 +1104,17 @@ while True:
 
         state="offscreen"
 
-        draw_offscreen_arrow(frame,corners_est)
+        arrow_dir=draw_offscreen_arrow(frame,corners_est)
+
+    elif target_behind:
+
+        # behind the camera there is no projected quad, but the map still knows the direction
+        state="offscreen"
+
+        arrow_dir=draw_offscreen_arrow(frame,direction=scene_map.target_direction(R_cur,w_ref,h_ref))
+
+    if calibrating or calibrate_requested:
+        draw_calibration_hud(frame,scene_map,waiting=not calibrating)
 
     # ---------------------------------
     # FPS
@@ -955,7 +1149,13 @@ while True:
             "detect_ms":round(detect_ms,1),
             "lost_frames":lost_frames,
             "visible":round(float(visible),2),
-            "stale":int(est_stale)
+            "stale":int(est_stale),
+            "yaw":"" if R_cur is None or R_stale else round(calibration.yaw_of(R_cur),1),
+            "calibrating":int(calibrating),
+            "arrow_x":"" if arrow_dir is None else round(float(arrow_dir[0]),2),
+            "arrow_y":"" if arrow_dir is None else round(float(arrow_dir[1]),2),
+            "corners_cx":"" if not fixed else round(float(corners_est.reshape(-1,2)[:,0].mean()),1),
+            "corners_cy":"" if not fixed else round(float(corners_est.reshape(-1,2)[:,1].mean()),1)
         })
 
         # snapshot whenever the overlay appears or disappears
@@ -980,10 +1180,23 @@ while True:
 
     cv2.imshow("AR Output",frame)
 
+    key=cv2.waitKey(1)&0xFF
+
+    # 'c' starts a calibration sweep (once the target is tracked) or finishes it
+    if key==ord('c'):
+        if calibrating:
+            finish_calibration()
+        else:
+            calibrate_requested = not calibrate_requested
+
     # 'q' in the video window, or closing the window
-    if stop_requested() or cv2.getWindowProperty("AR Output",cv2.WND_PROP_VISIBLE)<1:
+    if key==ord('q') or cv2.getWindowProperty("AR Output",cv2.WND_PROP_VISIBLE)<1:
         break
 
 cap.release()
 cv2.destroyAllWindows()
+
+if calibrating:
+    finish_calibration()
+
 close_run()
