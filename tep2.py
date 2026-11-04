@@ -2,6 +2,7 @@
 
 import cv2
 import numpy as np
+import sys
 import time
 
 # ================================
@@ -16,7 +17,11 @@ import time
 
 # ================================
 # ================================
-# URL = "http://X.X.X.X:Y/video"
+URL = "http://X.X.X.X:Y/video"
+
+# or pass it on the command line: python tep2.py http://192.168.1.7:4747/video
+if len(sys.argv) > 1:
+    URL = sys.argv[1]
 
 # So the Problem right now is the images which has low keypoints and descriptors have slow processing power and recognition power
 
