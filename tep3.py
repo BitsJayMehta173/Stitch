@@ -7,6 +7,7 @@ import sys
 import time
 
 import calibration
+import pipeline
 
 # =====================================
 # CONFIGURATION
@@ -29,6 +30,9 @@ URL = "http://192.168.1.7:4747/video"
 #   --calibrate   start a calibration sweep as soon as the target is found
 #                 (or press 'c' in the video window at any time)
 #   --no-map      ignore a saved calibration map
+#   --async       run re-anchoring SIFT in the background for video files too (on for live
+#                 streams; off for files by default so replays give repeatable results)
+#   --sync        run SIFT on the main loop even for live streams
 ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
 FLAGS = {a for a in sys.argv[1:] if a.startswith("--")}
 
@@ -102,6 +106,16 @@ LOST_FAST_FRAMES = 5        # search every frame right after a loss, for a quick
 LOST_DETECT_EVERY = 3       # then only every Nth frame, so a long loss does not tank the FPS
 BLUR_RATIO = 0.2            # frames this much blurrier than a typical tracked frame skip SIFT
 SAFETY_DETECT_EVERY = 15    # full-frame check every N frames while predicted out of view
+
+# ---- background detection ----
+# SIFT takes 50-130 ms; in the background, tracking keeps running meanwhile and the result
+# is carried forward to the current frame with optical flow when it arrives.
+ASYNC_DETECT = ("--async" in FLAGS or not IS_FILE) and "--sync" not in FLAGS
+# Results from more than this many frames ago are discarded. A far-away target needs the
+# full-resolution pass and took 13-18 frames in tests, so keep this generous.
+MAX_DETECT_AGE = 30
+SYNC_SEARCH_FRAMES = 15     # full-frame searches run immediately for this many frames after a loss
+FULL_RES_EVERY = 3           # during a loss, only every Nth full-frame search also runs at full resolution
 
 # ---- stream ----
 STREAM_TIMEOUT = 3.0        # seconds without frames before reconnecting to the stream
@@ -319,7 +333,7 @@ def geometric_filter(prev_pts,new_pts,ref_pts):
 detect_calls=0
 detect_ms=0.0
 
-def detect(gray,roi=None):
+def detect(gray,roi=None,sift=sift,flann=flann,scales=SIFT_SCALES):
 
     global detect_calls,detect_ms
 
@@ -334,9 +348,9 @@ def detect(gray,roi=None):
 
     result=None
 
-    for scale in SIFT_SCALES:
+    for scale in scales:
 
-        found = detect_at_scale(gray,scale)
+        found = detect_at_scale(gray,scale,sift,flann)
 
         if found is not None:
             ref_pts,frame_pts = found
@@ -349,7 +363,7 @@ def detect(gray,roi=None):
     return result
 
 
-def detect_at_scale(gray,scale):
+def detect_at_scale(gray,scale,sift,flann):
 
     # 1. Downscale the frame to drastically reduce SIFT processing time
     small_gray = gray if scale == 1.0 else cv2.resize(gray, (0, 0), fx=scale, fy=scale)
@@ -402,6 +416,145 @@ def detect_at_scale(gray,scale):
         return None
 
     return ref_pts[mask][unique_idx],frame_pts[mask][unique_idx]
+
+
+# =====================================
+# BACKGROUND DETECTION
+# =====================================
+
+class DetectRequest:
+    # what is needed to move a result from the frame it was computed on to a later one
+    def __init__(self,gray,frame_id,scales):
+        self.gray=gray
+        self.frame_id=frame_id
+        self.scales=scales
+        self.motion=np.eye(3)        # camera motion accumulated since that frame
+        self.motion_known=True
+
+# The worker gets its own SIFT and matcher: OpenCV feature objects are not safe to use
+# from two threads at once, and the main loop still runs its own searches.
+def make_background_detect():
+    bg_sift=cv2.SIFT_create(1200)
+    bg_flann=cv2.FlannBasedMatcher(index_params,search_params)
+    return lambda gray,roi,req: detect(gray,roi,bg_sift,bg_flann,req.scales)
+
+detector = pipeline.DetectWorker(make_background_detect()) if ASYNC_DETECT else None
+
+# set by request_detect: whether a detection actually finished this frame
+# (in the background a None result can also mean "not done yet")
+detect_completed=False
+
+# background detection outcomes, printed at exit
+detect_stats={"completed":0,"found":0,"forwarded":0,"age":[]}
+
+
+def advance_detect_request(M):
+    req = detector.in_flight() if detector is not None else None
+    if req is not None:
+        if M is None:
+            req.motion_known=False
+        else:
+            req.motion=M @ req.motion
+
+
+# Move points found on an earlier frame to the current one with optical flow, starting
+# from where the accumulated camera motion says they went.
+
+def forward_detection(req,found,gray):
+
+    ref_pts,pts=found
+    pts=pts.reshape(-1,1,2).astype(np.float32)
+
+    if frame_id-req.frame_id > MAX_DETECT_AGE or not req.motion_known:
+        return None
+
+    guess=cv2.perspectiveTransform(pts,req.motion).astype(np.float32)
+
+    nxt,status,_=cv2.calcOpticalFlowPyrLK(
+        req.gray,gray,pts,guess,flags=cv2.OPTFLOW_USE_INITIAL_FLOW,**lk_params
+    )
+
+    ok=status.ravel()==1
+
+    if ok.sum()<MIN_DETECT_INLIERS:
+        return None
+
+    return ref_pts.reshape(-1,2)[ok],nxt.reshape(-1,2)[ok]
+
+
+# Called once per frame: a background detection that has finished, moved to this frame
+# (or None). Sets detect_completed.
+
+def poll_detection(gray):
+
+    global detect_completed
+
+    detect_completed=False
+
+    if detector is None:
+        return None
+
+    done=detector.take()
+
+    if done is None:
+        return None
+
+    detect_completed=True
+    req,found=done
+    detect_stats["completed"]+=1
+
+    if found is None:
+        return None
+
+    detect_stats["found"]+=1
+    detect_stats["age"].append(frame_id-req.frame_id)
+    moved=forward_detection(req,found,gray)
+    detect_stats["forwarded"]+=moved is not None
+
+    # found, but too old or lost on the way to this frame: that is not a miss (it must not
+    # count towards backing off the search), just a detection to run again
+    if moved is None:
+        detect_completed=False
+
+    return moved
+
+
+# Detection entry point for the main loop. With background=True and the worker enabled,
+# it starts a detection on this frame if the worker is free and returns None;
+# poll_detection() delivers the result on a later frame. Otherwise it runs now.
+#
+# What goes to the background: re-anchors while tracking (the overlay keeps moving
+# smoothly; that is where the 50-130 ms SIFT stalls used to show) and full-frame searches
+# (in a live run these froze the display for 0.1-1 s, mostly while the target was not even
+# in view). Searches in a small window around a confident prediction run now: they are
+# cheap and a late result there only slows recovery.
+#
+# Full-frame searches are the expensive ones (two passes, half and full resolution).
+# During a long loss most of them use half resolution only; every FULL_RES_EVERY-th one
+# also tries full resolution, which a far-away target needs.
+
+full_searches=0
+
+def request_detect(gray,roi=None,background=False):
+
+    global detect_completed,full_searches
+
+    scales=SIFT_SCALES
+
+    if roi is None:
+        if full_searches % FULL_RES_EVERY:
+            scales=SIFT_SCALES[:1]
+        full_searches+=1
+
+    if detector is None or not background:
+        detect_completed=True
+        return detect(gray,roi,scales=scales)
+
+    if not detector.busy():
+        g=gray.copy()
+        detector.submit(DetectRequest(g,frame_id,scales),g,roi)
+
+    return None
 
 
 # =====================================
@@ -616,7 +769,15 @@ def open_source():
     return c
 
 
-cap=open_source()
+# A video file is read frame by frame on the main loop (replays must not skip frames);
+# a live stream is read on a background thread that always offers the newest frame.
+grabber=None
+
+if IS_FILE:
+    cap=open_source()
+else:
+    grabber=pipeline.FrameGrabber(open_source,FRAME_RESIZE)
+    cap=grabber.cap
 
 if not cap.isOpened():
     print(f"Could not open {URL}. Check the DroidCam URL or the video path.")
@@ -624,6 +785,10 @@ if not cap.isOpened():
 
 # frames are resized to FRAME_RESIZE; a different aspect ratio here means they get stretched
 print(f"Source resolution: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
+
+frame_seq=0
+frames_skipped=0
+skipped_now=0
 
 prev_time=time.time()
 
@@ -633,7 +798,7 @@ prev_time=time.time()
 
 LOG_FIELDS=["frame","t","fps","proc_ms","state","target_pts","motion_ok","motion_pts",
             "tx","ty","rot_deg","detect_calls","detect_ms","lost_frames","visible","stale",
-            "yaw","calibrating","arrow_x","arrow_y","corners_cx","corners_cy"]
+            "yaw","calibrating","arrow_x","arrow_y","corners_cx","corners_cy","skipped"]
 
 log_file=None
 input_writer=None
@@ -649,9 +814,10 @@ if LOG_RUNS:
     log_writer=csv.DictWriter(log_file,fieldnames=LOG_FIELDS)
     log_writer.writeheader()
     if RECORD_INPUT:
-        # MJPG/AVI stays readable even if the run is killed before the file is closed
-        input_writer=cv2.VideoWriter(os.path.join(run_dir,"input.avi"),
-                                     cv2.VideoWriter_fourcc(*"MJPG"),30,FRAME_RESIZE)
+        # MJPG/AVI stays readable even if the run is killed before the file is closed;
+        # encoding runs on a background thread
+        input_writer=pipeline.AsyncWriter(os.path.join(run_dir,"input.avi"),
+                                          cv2.VideoWriter_fourcc(*"MJPG"),30,FRAME_RESIZE)
     print(f"Logging this run to {run_dir}")
 
 
@@ -668,7 +834,6 @@ def close_run():
 
 atexit.register(close_run)
 
-last_frame_time=time.time()
 reconnects=0
 
 # =====================================
@@ -677,29 +842,41 @@ reconnects=0
 
 while True:
 
-    ret,frame=cap.read()
+    if grabber is None:
 
-    if not ret:
-        # a video file has ended; a live stream just dropped a frame
-        if IS_FILE or stop_requested():
+        ret,frame=cap.read()
+
+        # the video file has ended
+        if not ret:
             break
 
-        # or the stream died (DroidCam closed, Wi-Fi dropped): reconnect, then give up
-        if time.time()-last_frame_time > STREAM_TIMEOUT:
-            if reconnects >= STREAM_RECONNECTS:
-                print("Stream lost, giving up.")
+        frame=cv2.resize(frame,FRAME_RESIZE)
+
+    else:
+
+        new_frame,new_seq=grabber.read(frame_seq)
+
+        if new_frame is None:
+
+            if stop_requested():
                 break
-            reconnects+=1
-            print(f"No frames for {STREAM_TIMEOUT:.0f}s, reconnecting ({reconnects}/{STREAM_RECONNECTS})...")
-            cap.release()
-            cap=open_source()
-            last_frame_time=time.time()
-        continue
 
-    last_frame_time=time.time()
-    reconnects=0
+            # no frames: the stream died (DroidCam closed, Wi-Fi dropped); reconnect, then give up
+            if time.time()-grabber.last_frame_time > STREAM_TIMEOUT:
+                if reconnects >= STREAM_RECONNECTS:
+                    print("Stream lost, giving up.")
+                    break
+                reconnects+=1
+                print(f"No frames for {STREAM_TIMEOUT:.0f}s, reconnecting ({reconnects}/{STREAM_RECONNECTS})...")
+                grabber.reconnect()
+            continue
 
-    frame=cv2.resize(frame,FRAME_RESIZE)
+        # frames that arrived while the last one was processed are skipped (newest wins)
+        skipped_now=new_seq-frame_seq-1
+        frames_skipped+=skipped_now
+        frame,frame_seq=new_frame,new_seq
+        reconnects=0
+
     gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
 
     if input_writer is not None:
@@ -748,7 +925,9 @@ while True:
         else:
             R_stale = True
 
-    found=None
+    # a background detection that finished since the last frame, moved to this frame
+    advance_detect_request(M)
+    found=poll_detection(gray)
     good_new=None
 
     # ---------------------------------
@@ -817,7 +996,7 @@ while True:
         # waits for the next sharp frame instead of being skipped
         anchor_due = frames_since_anchor >= REDETECT_INTERVAL or (few_points and frames_since_anchor >= 3)
 
-        if anchor_due and not blurry:
+        if found is None and anchor_due and not blurry:
 
             frames_since_anchor = 0
 
@@ -825,7 +1004,7 @@ while True:
             # far-away target fills more of the search window
             roi = roi_around(corners_est,gray.shape) if corners_est is not None else None
 
-            found = detect(gray,roi)
+            found = request_detect(gray,roi,background=True)
 
         if found is None and len(good_new)<MIN_TRACKED_POINTS:
 
@@ -869,13 +1048,18 @@ while True:
 
         # predictions can be wrong (drift, a bad relocalization): while they say the target
         # is out of view, still look over the whole frame now and then
+        # Right after a loss, search now: the target is probably close and a fast recovery
+        # matters most. In a long loss, full-frame searches go to the background: the live
+        # freezes they caused happened while the target was not even in view.
+        long_loss = lost_frames > SYNC_SEARCH_FRAMES
+
         safety_check = not blurry and lost_frames % SAFETY_DETECT_EVERY == 0
 
         if target_behind:
 
             # the map says it is behind the camera: nothing to search for
             if safety_check:
-                found = detect(gray)
+                found = request_detect(gray,background=long_loss)
 
         elif corners_est is not None and (lost_frames <= PREDICT_MAX_FRAMES or (scene_map is not None and not calibrating)):
 
@@ -888,7 +1072,7 @@ while True:
             if search_now and (est_stale or search_misses >= 3):
 
                 # the prediction is unreliable: look everywhere
-                found = detect(gray)
+                found = request_detect(gray,background=long_loss)
 
             elif search_now and should_be_visible:
 
@@ -897,13 +1081,13 @@ while True:
                 roi = roi_around(corners_est,gray.shape)
 
                 if roi is not None:
-                    found = detect(gray,roi)
+                    found = request_detect(gray,roi)
 
             elif safety_check:
 
-                found = detect(gray)
+                found = request_detect(gray,background=long_loss)
 
-            if search_now and found is None and (est_stale or should_be_visible):
+            if detect_completed and found is None and (est_stale or should_be_visible):
                 search_misses += 1
 
         else:
@@ -917,8 +1101,10 @@ while True:
 
                 frames_since_detect = 0
 
-                found = detect(gray)
+                found = request_detect(gray,background=long_loss)
 
+            # (a background search reports back on a later frame)
+            if detect_completed:
                 if found is not None:
                     detect_interval = DETECT_BASE_INTERVAL
                 else:
@@ -986,6 +1172,8 @@ while True:
             est_stale=False
             search_misses=0
             fixed=True
+            detect_interval=DETECT_BASE_INTERVAL
+            full_searches=0
 
             # Only seed right after a sharp SIFT fix: reference coordinates of new points
             # come from the current pose, so seeding from a tracked (possibly slightly
@@ -1087,18 +1275,21 @@ while True:
 
         area=cv2.contourArea(corners_est.reshape(-1,2).astype(np.float32))
 
-        if area>MIN_OVERLAY_AREA:
+        # only warp and blend inside the target's bounding box, not the whole frame
+        x,y,w,h=cv2.boundingRect(corners_est.reshape(-1,1,2).astype(np.float32))
+        x1,y1=max(x,0),max(y,0)
+        x2,y2=min(x+w,frame.shape[1]),min(y+h,frame.shape[0])
 
-            size=(frame.shape[1],frame.shape[0])
+        if area>MIN_OVERLAY_AREA and x2>x1 and y2>y1:
 
-            warped=cv2.warpPerspective(overlay,H,size)
-            mask=cv2.warpPerspective(overlay_mask,H,size)
-            mask_inv=cv2.bitwise_not(mask)
+            # same homography, shifted so the box's corner is the origin
+            T=np.array([[1,0,-x1],[0,1,-y1],[0,0,1]],np.float64) @ H
+            size=(x2-x1,y2-y1)
 
-            frame_bg=cv2.bitwise_and(frame,frame,mask=mask_inv)
-            overlay_fg=cv2.bitwise_and(warped,warped,mask=mask)
+            warped=cv2.warpPerspective(overlay,T,size)
+            mask=cv2.warpPerspective(overlay_mask,T,size)
 
-            frame=cv2.add(frame_bg,overlay_fg)
+            np.copyto(frame[y1:y2,x1:x2],warped,where=mask[...,None]>0)
 
     elif corners_est is not None and not est_stale and visible < 0.05:
 
@@ -1155,7 +1346,8 @@ while True:
             "arrow_x":"" if arrow_dir is None else round(float(arrow_dir[0]),2),
             "arrow_y":"" if arrow_dir is None else round(float(arrow_dir[1]),2),
             "corners_cx":"" if not fixed else round(float(corners_est.reshape(-1,2)[:,0].mean()),1),
-            "corners_cy":"" if not fixed else round(float(corners_est.reshape(-1,2)[:,1].mean()),1)
+            "corners_cy":"" if not fixed else round(float(corners_est.reshape(-1,2)[:,1].mean()),1),
+            "skipped":skipped_now
         })
 
         # snapshot whenever the overlay appears or disappears
@@ -1167,12 +1359,18 @@ while True:
             snapshots+=1
         last_state=state
 
-        recent.append((fps,state))
+        if not recent:
+            window_start=time.time()
+
+        recent.append((skipped_now,state))
 
         if len(recent)>=30:
             states=[s for _,s in recent]
             share=lambda *names: 100*sum(s in names for s in states)//len(states)
-            print(f"[{time.time()-run_start:6.1f}s] fps {np.mean([f for f,_ in recent]):4.0f} | "
+            # frames actually processed per second (averaging per-frame 1/dt overstates it),
+            # and how many camera frames per second arrived but were skipped
+            elapsed=max(time.time()-window_start,1e-6)
+            print(f"[{time.time()-run_start:6.1f}s] fps {len(recent)/elapsed:4.0f} (+{sum(k for k,_ in recent)/elapsed:3.0f} skipped) | "
                   f"overlay {share('track','detect','coast'):3d}% (coast {share('coast'):3d}%) | "
                   f"offscreen {share('offscreen'):3d}% | lost {share('lost'):3d}%",flush=True)
             recent=[]
@@ -1193,10 +1391,18 @@ while True:
     if key==ord('q') or cv2.getWindowProperty("AR Output",cv2.WND_PROP_VISIBLE)<1:
         break
 
-cap.release()
+if grabber is not None:
+    grabber.release()
+else:
+    cap.release()
 cv2.destroyAllWindows()
 
 if calibrating:
     finish_calibration()
+
+if detector is not None and detect_stats["completed"]:
+    print(f"Background detection: {detect_stats['completed']} finished, {detect_stats['found']} found the target, "
+          f"{detect_stats['forwarded']} carried to the current frame "
+          f"(median age {np.median(detect_stats['age']) if detect_stats['age'] else 0:.0f} frames)")
 
 close_run()

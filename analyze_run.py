@@ -32,6 +32,10 @@ duration = float(rows[-1]["t"])
 
 print(f"run: {run_dir}")
 print(f"{len(rows)} frames in {duration:.1f}s ({len(rows) / max(duration, 1e-6):.1f} fps delivered)")
+if rows[0].get("skipped") not in (None, ""):
+    skipped = sum(int(r["skipped"]) for r in rows)
+    print(f"camera sent {(len(rows) + skipped) / max(duration, 1e-6):.1f} fps; {skipped} frames skipped "
+          f"because the loop was busy (newest frame wins)")
 print()
 print("time per state:")
 for s in ("track", "detect", "coast", "offscreen", "lost"):
