@@ -8,6 +8,7 @@ import time
 
 import calibration
 import pipeline
+import posts
 
 # =====================================
 # CONFIGURATION
@@ -33,8 +34,19 @@ URL = "http://192.168.1.7:4747/video"
 #   --async       run re-anchoring SIFT in the background for video files too (on for live
 #                 streams; off for files by default so replays give repeatable results)
 #   --sync        run SIFT on the main loop even for live streams
+#   --post=FOLDER       show a saved post (posts/<name>) instead of reference.jpg/overlay.png
+#   --content=IMAGE     image to pin when placing a new post (default overlay.png)
+#   --place=X,Y,W,H     place a new post at that rectangle of the first frame, without
+#                       the mouse (for scripts); interactively, press 'n' and drag instead
 ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
 FLAGS = {a for a in sys.argv[1:] if a.startswith("--")}
+
+
+def flag_value(name):
+    for f in FLAGS:
+        if f.startswith(name+"="):
+            return f.split("=",1)[1]
+    return None
 
 if ARGS:
     URL = ARGS[0]
@@ -136,54 +148,88 @@ detect_interval = DETECT_BASE_INTERVAL
 frames_since_detect = 0
 
 # =====================================
-# LOAD IMAGES
-# =====================================
-
-reference = cv2.imread(REFERENCE_IMAGE,0)
-overlay = cv2.imread(OVERLAY_IMAGE)
-
-if reference is None or overlay is None:
-    print("Image load error")
-    exit()
-
-h_ref,w_ref = reference.shape
-overlay = cv2.resize(overlay,(w_ref,h_ref))
-
-# warped separately so black pixels inside the overlay are not treated as transparent
-overlay_mask = np.full((h_ref,w_ref),255,np.uint8)
-
-ref_corners=np.float32([
-    [0,0],
-    [w_ref,0],
-    [w_ref,h_ref],
-    [0,h_ref]
-]).reshape(-1,1,2)
-
-# =====================================
 # SIFT INITIALIZATION
 # =====================================
 
 sift = cv2.SIFT_create(1200)
 
-# keypoint positions are stored in full-resolution reference coordinates
-kp_ref_pts=[]
-des_ref_levels=[]
-
-for s in REF_PYRAMID:
-    level = reference if s == 1.0 else cv2.resize(reference,None,fx=s,fy=s,interpolation=cv2.INTER_AREA)
-    kps,des = sift.detectAndCompute(level,None)
-    if des is None:
-        continue
-    kp_ref_pts += [(kp.pt[0]/s,kp.pt[1]/s) for kp in kps]
-    des_ref_levels.append(des)
-
-kp_ref_pts=np.float32(kp_ref_pts)
-des_ref=np.vstack(des_ref_levels)
-
 index_params=dict(algorithm=1,trees=5)
 search_params=dict(checks=50)
 
 flann=cv2.FlannBasedMatcher(index_params,search_params)
+
+# =====================================
+# TARGET
+# =====================================
+
+# The target has two parts: the ANCHOR, the image that is tracked, and the CONTENT, the
+# image that is shown, placed by 4 corners in anchor coordinates.
+#   classic:  anchor = REFERENCE_IMAGE, content = OVERLAY_IMAGE stretched over all of it
+#   post:     anchor = a patch of textured wall saved in a post (see posts.py), content =
+#             the post's image, floating wherever it was placed relative to that patch
+
+# keypoint positions are stored in full-resolution reference coordinates
+
+def build_reference_model(gray):
+    kp_pts,des_levels=[],[]
+    for s in REF_PYRAMID:
+        level = gray if s == 1.0 else cv2.resize(gray,None,fx=s,fy=s,interpolation=cv2.INTER_AREA)
+        kps,des = sift.detectAndCompute(level,None)
+        if des is None:
+            continue
+        kp_pts += [(kp.pt[0]/s,kp.pt[1]/s) for kp in kps]
+        des_levels.append(des)
+    return np.float32(kp_pts),np.vstack(des_levels)
+
+
+target_version=0
+
+def set_target(anchor_gray,content,quad=None):
+
+    global reference,h_ref,w_ref,ref_corners,ref_model,overlay,overlay_mask
+    global content_quad,content_H,target_version
+
+    reference=anchor_gray
+    h_ref,w_ref=reference.shape
+
+    ref_corners=np.float32([
+        [0,0],
+        [w_ref,0],
+        [w_ref,h_ref],
+        [0,h_ref]
+    ]).reshape(-1,1,2)
+
+    # keypoints and descriptors are swapped in one assignment: the background
+    # detector may be reading the previous model at this moment
+    ref_model=build_reference_model(reference)
+
+    overlay=content
+    # warped separately so black pixels inside the overlay are not treated as transparent
+    overlay_mask=np.full(content.shape[:2],255,np.uint8)
+
+    ch,cw=content.shape[:2]
+    content_quad=(ref_corners if quad is None else np.float32(quad)).reshape(-1,1,2)
+    content_H=cv2.getPerspectiveTransform(
+        np.float32([[0,0],[cw,0],[cw,ch],[0,ch]]),content_quad.reshape(4,2))
+
+    target_version+=1
+
+
+POST_FOLDER=flag_value("--post")
+CONTENT_IMAGE=flag_value("--content") or OVERLAY_IMAGE
+PLACE_RECT=tuple(int(v) for v in flag_value("--place").split(",")) if flag_value("--place") else None
+
+if POST_FOLDER:
+    post=posts.load(POST_FOLDER)
+    set_target(post["anchor"],post["content"],post["quad"])
+    print(f"Showing post '{post['name']}' from {POST_FOLDER}")
+else:
+    reference = cv2.imread(REFERENCE_IMAGE,0)
+    overlay = cv2.imread(OVERLAY_IMAGE)
+    if reference is None or overlay is None:
+        print("Image load error")
+        exit()
+    set_target(reference,overlay)
 
 # =====================================
 # OPTICAL FLOW SETTINGS
@@ -218,7 +264,9 @@ search_misses=0
 frames_since_anchor=0
 
 # ---- scene map state ----
-map_path=os.path.join(CALIBRATION_DIR,os.path.splitext(os.path.basename(REFERENCE_IMAGE))[0]+".npz")
+# a post keeps its own calibration in its folder
+map_path=(os.path.join(POST_FOLDER,"map.npz") if POST_FOLDER else
+          os.path.join(CALIBRATION_DIR,os.path.splitext(os.path.basename(REFERENCE_IMAGE))[0]+".npz"))
 scene_map=None
 calibrating=False
 calibrate_requested="--calibrate" in FLAGS
@@ -333,7 +381,10 @@ def geometric_filter(prev_pts,new_pts,ref_pts):
 detect_calls=0
 detect_ms=0.0
 
-def detect(gray,roi=None,sift=sift,flann=flann,scales=SIFT_SCALES):
+def detect(gray,roi=None,sift=sift,flann=flann,scales=SIFT_SCALES,model=None):
+
+    # read the reference model once: set_target() may swap it meanwhile
+    model = ref_model if model is None else model
 
     global detect_calls,detect_ms
 
@@ -350,7 +401,7 @@ def detect(gray,roi=None,sift=sift,flann=flann,scales=SIFT_SCALES):
 
     for scale in scales:
 
-        found = detect_at_scale(gray,scale,sift,flann)
+        found = detect_at_scale(gray,scale,sift,flann,model)
 
         if found is not None:
             ref_pts,frame_pts = found
@@ -363,7 +414,9 @@ def detect(gray,roi=None,sift=sift,flann=flann,scales=SIFT_SCALES):
     return result
 
 
-def detect_at_scale(gray,scale,sift,flann):
+def detect_at_scale(gray,scale,sift,flann,model):
+
+    kp_ref_pts,des_ref = model
 
     # 1. Downscale the frame to drastically reduce SIFT processing time
     small_gray = gray if scale == 1.0 else cv2.resize(gray, (0, 0), fx=scale, fy=scale)
@@ -425,6 +478,9 @@ def detect_at_scale(gray,scale,sift,flann):
 class DetectRequest:
     # what is needed to move a result from the frame it was computed on to a later one
     def __init__(self,gray,frame_id,scales):
+        # the target it was searched for; a result for a target since replaced is dropped
+        self.model=ref_model
+        self.version=target_version
         self.gray=gray
         self.frame_id=frame_id
         self.scales=scales
@@ -436,7 +492,7 @@ class DetectRequest:
 def make_background_detect():
     bg_sift=cv2.SIFT_create(1200)
     bg_flann=cv2.FlannBasedMatcher(index_params,search_params)
-    return lambda gray,roi,req: detect(gray,roi,bg_sift,bg_flann,req.scales)
+    return lambda gray,roi,req: detect(gray,roi,bg_sift,bg_flann,req.scales,req.model)
 
 detector = pipeline.DetectWorker(make_background_detect()) if ASYNC_DETECT else None
 
@@ -499,8 +555,13 @@ def poll_detection(gray):
     if done is None:
         return None
 
-    detect_completed=True
     req,found=done
+
+    # searched for a target that has since been replaced (a new post was placed)
+    if req.version!=target_version:
+        return None
+
+    detect_completed=True
     detect_stats["completed"]+=1
 
     if found is None:
@@ -748,6 +809,117 @@ def draw_calibration_hud(frame,scene_map,waiting):
 
 
 # =====================================
+# PLACING POSTS
+# =====================================
+
+def content_image():
+    img=cv2.imread(CONTENT_IMAGE)
+    if img is None:
+        raise FileNotFoundError(f"cannot read content image {CONTENT_IMAGE}")
+    return img
+
+
+# Freeze the frame and let the user drag a rectangle where the image should go, with a
+# live preview and a check that the spot has enough texture to be found again.
+# Returns (x, y, w, h), or None if cancelled.
+
+def choose_rect(frozen,content):
+
+    drag={"a":None,"b":None,"down":False}
+
+    def on_mouse(event,x,y,flags,param):
+        if event==cv2.EVENT_LBUTTONDOWN:
+            drag.update(a=(x,y),b=(x,y),down=True)
+        elif event==cv2.EVENT_MOUSEMOVE and drag["down"]:
+            drag["b"]=(x,y)
+        elif event==cv2.EVENT_LBUTTONUP:
+            drag.update(b=(x,y),down=False)
+
+    cv2.setMouseCallback("AR Output",on_mouse)
+    checked,check=None,None
+
+    while True:
+
+        view=frozen.copy()
+        rect=None
+
+        if drag["a"] is not None:
+            (ax,ay),(bx,by)=drag["a"],drag["b"]
+            rect=(min(ax,bx),min(ay,by),abs(bx-ax),abs(by-ay))
+
+        if rect is not None and rect[2]>=20 and rect[3]>=20:
+
+            # preview the content where it would go
+            quad=posts.fit_content(rect,content.shape)
+            ch,cw=content.shape[:2]
+            P=cv2.getPerspectiveTransform(np.float32([[0,0],[cw,0],[cw,ch],[0,ch]]),quad)
+            warped=cv2.warpPerspective(content,P,(view.shape[1],view.shape[0]))
+            pmask=cv2.warpPerspective(np.full((ch,cw),255,np.uint8),P,(view.shape[1],view.shape[0]))
+            np.copyto(view,warped,where=pmask[...,None]>0)
+
+            # texture check once the drag is released (it runs SIFT on the patch)
+            if not drag["down"] and checked!=rect:
+                checked,check=rect,posts.check_anchor(frozen,rect)
+
+            if check is not None and checked==rect:
+                ok,n,(qx,qy,qw,qh)=check
+                colour=(0,200,0) if ok else (0,0,255)
+                cv2.rectangle(view,(qx,qy),(qx+qw,qy+qh),colour,1)
+                cv2.putText(view,(f"{n} features: ENTER to post" if ok else
+                                  f"only {n} features: too plain, pick a more detailed spot"),
+                            (20,view.shape[0]-40),cv2.FONT_HERSHEY_SIMPLEX,0.6,colour,2)
+
+            cv2.rectangle(view,rect[:2],(rect[0]+rect[2],rect[1]+rect[3]),(0,200,255),2)
+
+        cv2.putText(view,"PLACE: drag a box on a textured spot (wall art, bricks, signs). ESC cancels",
+                    (20,30),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,255),2)
+        cv2.imshow("AR Output",view)
+
+        key=cv2.waitKey(20)&0xFF
+
+        if key==27 or cv2.getWindowProperty("AR Output",cv2.WND_PROP_VISIBLE)<1:
+            return None
+
+        if key in (13,10,32) and check is not None and checked==rect and check[0]:
+            return rect
+
+
+# Make a saved post the current target, starting tracking (and any calibration) afresh.
+
+def switch_to_post(folder):
+
+    global POST_FOLDER,map_path,scene_map,map_ok,R_cur,R_stale,calibrating,calibrate_requested
+    global prev_pts,ref_pts,corners_est,lost_frames,est_stale,search_misses,frames_since_anchor
+    global detect_interval,frames_since_detect
+
+    post=posts.load(folder)
+    set_target(post["anchor"],post["content"],post["quad"])
+
+    POST_FOLDER=folder
+    map_path=os.path.join(folder,"map.npz")
+    scene_map=calibration.SceneMap.load(map_path) if os.path.isfile(map_path) else None
+    map_ok=False
+    R_cur,R_stale=None,True
+    calibrating=calibrate_requested=False
+
+    prev_pts=ref_pts=corners_est=None
+    lost_frames=search_misses=frames_since_anchor=frames_since_detect=0
+    est_stale=False
+    detect_interval=DETECT_BASE_INTERVAL
+
+    print(f"Now showing post '{post['name']}' ({folder}). Share that folder; others open it with --post={folder}")
+
+
+def place_post(frame,rect):
+    try:
+        folder=posts.create(frame,rect,content_image(),posts_dir=os.environ.get("STITCH_POSTS_DIR",posts.POSTS_DIR))
+    except ValueError as e:
+        print(f"Could not place the post: {e}")
+        return
+    switch_to_post(folder)
+
+
+# =====================================
 # STREAM
 # =====================================
 
@@ -878,6 +1050,13 @@ while True:
         reconnects=0
 
     gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
+
+    # an undrawn copy, for placing a post on this frame
+    raw_frame=frame.copy()
+
+    # --place: pin the content on the very first frame, without the mouse
+    if frame_id==0 and PLACE_RECT is not None:
+        place_post(raw_frame,PLACE_RECT)
 
     if input_writer is not None:
         input_writer.write(frame)
@@ -1275,15 +1454,28 @@ while True:
 
         area=cv2.contourArea(corners_est.reshape(-1,2).astype(np.float32))
 
-        # only warp and blend inside the target's bounding box, not the whole frame
-        x,y,w,h=cv2.boundingRect(corners_est.reshape(-1,1,2).astype(np.float32))
-        x1,y1=max(x,0),max(y,0)
-        x2,y2=min(x+w,frame.shape[1]),min(y+h,frame.shape[0])
+        # where the content lands: H maps the anchor into the frame, content_H maps the
+        # content image onto its spot in anchor coordinates (all of the anchor in
+        # classic mode; anywhere around it for a post)
+        H_content=H @ content_H
+
+        # a spot beside the anchor seen at a steep angle can project behind the camera
+        w_h=(H @ np.vstack([content_quad.reshape(4,2).T,np.ones(4)]))[2]
+        in_front=(w_h>1e-6).all()
+
+        content_px=cv2.perspectiveTransform(content_quad,H) if in_front else None
+
+        # only warp and blend inside the content's bounding box, not the whole frame
+        x1=y1=x2=y2=0
+        if in_front:
+            x,y,w,h=cv2.boundingRect(content_px.astype(np.float32))
+            x1,y1=max(x,0),max(y,0)
+            x2,y2=min(x+w,frame.shape[1]),min(y+h,frame.shape[0])
 
         if area>MIN_OVERLAY_AREA and x2>x1 and y2>y1:
 
             # same homography, shifted so the box's corner is the origin
-            T=np.array([[1,0,-x1],[0,1,-y1],[0,0,1]],np.float64) @ H
+            T=np.array([[1,0,-x1],[0,1,-y1],[0,0,1]],np.float64) @ H_content
             size=(x2-x1,y2-y1)
 
             warped=cv2.warpPerspective(overlay,T,size)
@@ -1306,6 +1498,10 @@ while True:
 
     if calibrating or calibrate_requested:
         draw_calibration_hud(frame,scene_map,waiting=not calibrating)
+    else:
+        label=f"post: {os.path.basename(POST_FOLDER)}" if POST_FOLDER else "target: "+REFERENCE_IMAGE
+        cv2.putText(frame,f"{label}   n = pin image here   c = calibrate   q = quit",
+                    (20,frame.shape[0]-15),cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,255,255),1)
 
     # ---------------------------------
     # FPS
@@ -1386,6 +1582,12 @@ while True:
             finish_calibration()
         else:
             calibrate_requested = not calibrate_requested
+
+    # 'n' freezes the frame to pin the content image somewhere on it
+    if key==ord('n'):
+        rect=choose_rect(raw_frame,content_image())
+        if rect is not None:
+            place_post(raw_frame,rect)
 
     # 'q' in the video window, or closing the window
     if key==ord('q') or cv2.getWindowProperty("AR Output",cv2.WND_PROP_VISIBLE)<1:

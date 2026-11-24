@@ -15,6 +15,22 @@
 #### Then use the IP address of the Mobile camera to access the live feed 
 #### Then you can change the overlay.png and reference.jpg to your choice to experience the mobile AR/VR of your own.
 
+## Pin an image on any wall (posts)
+
+```
+python tep3.py http://<phone-ip>:4747/video --content=my_image.png
+```
+
+Point the camera at a textured spot (wall art, bricks, signs, posters), press `n`, drag a box where the image should go and press `Enter`. The patch of wall around the box is saved as the anchor, and the image stays pinned there from any angle and distance. Plain painted walls are refused: there is nothing there to recognise the spot by.
+
+The post is saved as a folder in `posts/` (anchor, image and placement). Share the folder; anyone who opens it and points their camera at the same spot sees the image there:
+
+```
+python tep3.py http://<phone-ip>:4747/video --post=posts/<name>
+```
+
+Other keys: `c` calibrates (turn in place to map the surroundings, saved inside the post), `q` quits.
+
 # Overview
 
 This project demonstrates a computer vision–based augmented reality screen projection system. Using feature detection and homography estimation, the application can project a digital screen (such as a laptop display screenshot) onto a real-world surface captured by a camera.
